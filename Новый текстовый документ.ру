@@ -1,0 +1,104 @@
+import requests
+import time
+import json
+import logging
+
+# ========== НАСТРОЙКИ (впишите свои данные) ==========
+WB_API_TOKEN = "eyJhbGciOiJFUzI1NiIsImtpZCI6IjIwMjYwMzAydjEiLCJ0eXAiOiJKV1QifQ.eyJhY2MiOjEsImVudCI6MSwiZXhwIjoxNzkyNzkxMjA3LCJpZCI6IjAxOWRiZWQ2LTQ5YmItN2M5Yy05NGMwLWI3ZDZmZTFjN2NlNiIsImlpZCI6MjI2NzEwNzEsIm9pZCI6NDUzODUsInMiOjUxNCwic2lkIjoiZTMxN2ZmZDItY2ZjNC01ZDI5LTg4N2MtNWYxMmZiZTNiZmZmIiwidCI6ZmFsc2UsInVpZCI6MjI2NzEwNzF9.xRmEv6psnfyR5ptq6aRhQzPGtTY-PIq0rpHD4rBbsFSkxGBXS4vOAp9l_PY03aAE2AaOOZoFy6xO1hyhazHl2g"
+TG_BOT_TOKEN = "8636499199:AAFmf61GNOvIt5uF5al9SS9PZlEW94qAxVY"
+TG_YOUR_ID = 591256950
+# ====================================================
+
+# Адреса API Wildberries (актуальны для версии v1)
+WB_API_URL = "https://feedbacks-api.wildberries.ru/api/v1/feedbacks"
+WB_ANSWER_URL = "https://feedbacks-api.wildberries.ru/api/v1/feedback/{id}/answer"
+
+# Заготовленные ответы для хороших отзывов
+POSITIVE_TEMPLATES = [
+    "Спасибо за высокую оценку 😊 Рады, что вы остались довольны. Ждём вас снова в Stroller Acss!",
+    "Благодарим за отзыв! Мы стараемся для вас и ваших малышей ❤️",
+    "Спасибо, что выбрали Stroller Acss! Всегда рады помочь."
+]
+
+def send_telegram(text, keyboard=None):
+    """Отправляет сообщение с кнопками в Telegram"""
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TG_YOUR_ID, "text": text, "parse_mode": "HTML"}
+    if keyboard:
+        data["reply_markup"] = json.dumps(keyboard)
+    requests.post(url, data=data)
+
+def get_new_feedbacks():
+    """Забирает отзывы без ответа"""
+    headers = {"Authorization": WB_API_TOKEN}
+    params = {"isAnswered": False, "take": 20}
+    try:
+        resp = requests.get(WB_API_URL, headers=headers, params=params, timeout=30)
+        if resp.status_code == 200:
+            return resp.json().get("feedbacks", [])
+        else:
+            send_telegram(f"⚠️ Ошибка WB API: {resp.status_code}")
+            return []
+    except Exception as e:
+        send_telegram(f"❌ Не удалось получить отзывы: {e}")
+        return []
+
+def ask_ai_for_reply(text, product_name):
+    """Генерирует ответ через YandexGPT (бесплатно)"""
+    # Замените на свой ключ Yandex Cloud (или оставьте как есть с заглушкой)
+    prompt = f"""
+Ты оператор бренда детских аксессуаров Stroller Acss.
+Товар: {product_name}
+Отзыв: {text}
+
+Напиши вежливый ответ с извинением и предложением помощи. 
+Не обещай возврат денег сразу, попроси номер заказа для решения проблемы.
+Ответ максимум 2 предложения.
+"""
+    # ПРОСТАЯ ЗАГЛУШКА — вместо ИИ генерируем шаблон
+    return f"Здравствуйте! Спасибо за отзыв о {product_name}. Приносим извинения за неудобства. Пожалуйста, напишите номер заказа в личные сообщения — разберёмся и решим проблему."
+
+def post_answer(feedback_id, answer_text):
+    """Отправляет ответ в Wildberries"""
+    url = WB_ANSWER_URL.format(id=feedback_id)
+    headers = {"Authorization": WB_API_TOKEN, "Content-Type": "application/json"}
+    data = {"text": answer_text}
+    resp = requests.put(url, headers=headers, json=data, timeout=20)
+    return resp.status_code == 204
+
+def auto_reply_positive(review):
+    """Автоответ на хороший отзыв (4-5★)"""
+    import random
+    reply = random.choice(POSITIVE_TEMPLATES)
+    if post_answer(review["id"], reply):
+        send_telegram(f"✅ Автоответ на ★★★★★\n{review['text'][:80]}...\nОтвет: {reply}")
+    else:
+        send_telegram(f"❌ Ошибка отправки автоответа\n{review['text'][:80]}")
+
+def manual_negative_approve(review):
+    """Отправляет админу отзыв с кнопками для выбора ответа"""
+    ai_answer = ask_ai_for_reply(review["text"], review.get("productName", "аксессуар"))
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "✅ Отправить этот ответ", "callback_data": f"send_{review['id']}_{ai_answer[:50]}"}],
+            [{"text": "✏️ Написать самому", "callback_data": f"edit_{review['id']}"}]
+        ]
+    }
+    text = f"❗️ <b>Новый негативный отзыв</b>\nТовар: {review.get('productName', '-')}\nТекст: {review['text']}\n\n<b>Предложенный ответ ИИ:</b>\n{ai_answer}"
+    send_telegram(text, keyboard)
+
+def main_loop():
+    """Главный цикл"""
+    send_telegram("🚀 Бот запущен. Отслеживаю отзывы...")
+    while True:
+        feedbacks = get_new_feedbacks()
+        for fb in feedbacks:
+            if fb["productValuation"] >= 4: # 4-5 ★
+                auto_reply_positive(fb)
+            else: # 1-3 ★
+                manual_negative_approve(fb)
+        time.sleep(900) # пауза 15 минут
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    main_loop()
